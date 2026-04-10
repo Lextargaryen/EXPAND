@@ -3,16 +3,26 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║          EXPAND — DARK FANTASY TEXT ADVENTURE ENGINE         ║
-║                      Advanced v2.0                           ║
+║              Advanced v2.1 — Llama 3 8B Edition              ║
 ╚══════════════════════════════════════════════════════════════╝
 
-Improvements over v1:
-  - Full save/load system (JSON state file + human-readable session log)
-  - Reality Grounding Layer: flags impossible actions BEFORE the LLM sees them
-  - Player stats: HP, stamina, sanity
-  - Persistent inventory system
+Changes in v2.1:
+  - Prompt format switched from Alpaca to Llama 3 chat template
+    (<|begin_of_text|> / <|start_header_id|> / <|eot_id|>)
+  - Model & tokenizer assumed pre-loaded in Colab as globals
+    (model, tokenizer) — no reload, no VRAM waste
+  - Token length guard: trims history if prompt exceeds
+    MAX_PROMPT_TOKENS to prevent context-overflow OOM crashes
+  - generate() kwargs updated for Llama 3 best practice
+    (do_sample=True, pad_token_id set to eos_token_id)
+  - Type hints made Python 3.9-safe (Optional[] instead of X|None)
+
+From v2.0:
+  - Full save/load system (JSON state file + human-readable log)
+  - Reality Grounding Layer pre-LLM impossible-action filter
+  - Player stats: HP, stamina, sanity with D20 consequences
+  - Persistent inventory with [PICKUP]/[DROP] tag parsing
   - Rolling conversation history for context continuity
-  - Session transcript saved to .txt
   - Timestamped auto-save on every turn
 """
 
@@ -22,11 +32,11 @@ import os
 import random
 import re
 import requests
-import sys
 import torch
 import faiss
 import numpy as np
 from datetime import datetime
+from typing import Optional, Tuple
 from sentence_transformers import SentenceTransformer
 from unsloth import FastLanguageModel
 
@@ -35,15 +45,33 @@ SAVE_FILE      = "expand_save.json"
 SESSION_LOG    = "expand_session_log.txt"
 LORE_CACHE     = "world_lore_cache.md"
 
-# ── VRAM CLEANUP ───────────────────────────────────────────────────────────────
-print("Initializing engine and clearing VRAM...")
-try:
-    del trainer
-except NameError:
-    pass
+# ── LLAMA 3 CONFIG ─────────────────────────────────────────────────────────────
+# Maximum tokens allowed in the prompt before we trim conversation history.
+# Llama 3 8B supports 8192 tokens; we stay well under to leave room for output.
+MAX_PROMPT_TOKENS = 1800
+
+# ── MODEL CHECK ────────────────────────────────────────────────────────────────
+# The model and tokenizer are assumed to already be loaded in the Colab session
+# as the globals `model` and `tokenizer`. We just flush the CUDA cache, switch
+# to inference mode, and verify they exist — no reload needed.
+print("Preparing engine (model assumed pre-loaded)...")
 torch.cuda.empty_cache()
 gc.collect()
-FastLanguageModel.for_inference(model)
+
+try:
+    _model_name = getattr(model, "name_or_path",
+                  getattr(model.config, "_name_or_path", "unknown"))
+    print(f"  Model detected : {_model_name}")
+    FastLanguageModel.for_inference(model)   # enable unsloth 2x inference speed
+    print("  Inference mode : enabled (unsloth fast path)")
+except NameError:
+    raise RuntimeError(
+        "\n[FATAL] `model` or `tokenizer` globals not found.\n"
+        "Run your model-loading cell before executing this engine.\n"
+        "Expected:\n"
+        "  model, tokenizer = FastLanguageModel.from_pretrained(\n"
+        "      model_name='unsloth/Meta-Llama-3-8B-bnb-4bit', ...)\n"
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 1 — REALITY GROUNDING LAYER
@@ -93,7 +121,7 @@ IMPOSSIBLE_PATTERNS = [
      "Describe the cold finality of that."),
 ]
 
-def check_reality(action: str) -> str | None:
+def check_reality(action: str) -> Optional[str]:
     """
     Returns a grounding directive string if the action violates physical reality,
     or None if the action is plausible.
@@ -173,7 +201,7 @@ def save_game(state: dict) -> None:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
 
-def load_game() -> dict | None:
+def load_game() -> Optional[dict]:
     if not os.path.exists(SAVE_FILE):
         return None
     try:
@@ -298,19 +326,23 @@ def get_relevant_lore(query: str, k: int = 2) -> str:
     return "\n".join(raw_chunks[i] for i in indices[0] if i < len(raw_chunks))
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 4 — PROMPTING SYSTEM
+#  SECTION 4 — PROMPTING SYSTEM  (Llama 3 chat template)
 # ══════════════════════════════════════════════════════════════════════════════
 
-ALPACA_PROMPT = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+# Llama 3 uses a structured chat format with special header tokens.
+# The model was trained to expect this exact layout — using Alpaca-style
+# ### Instruction / ### Response with Llama 3 produces degraded outputs.
+#
+# Format:
+#   <|begin_of_text|>
+#   <|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|>
+#   <|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|>
+#   <|start_header_id|>assistant<|end_header_id|>\n\n
+#
+# The trailing assistant header with NO closing <|eot_id|> is the generation
+# trigger — the model fills in from that point onward.
 
-### Instruction:
-{}
-### Input:
-{}
-### Response:
-{}"""
-
-GM_INSTRUCTION = """You are a strict, grounded, and imaginative Game Master running a dark fantasy text adventure set in the world of EXPAND — a world slowly being unmade by shadow.
+GM_SYSTEM_PROMPT = """You are a strict, grounded, and imaginative Game Master running a dark fantasy text adventure set in the world of EXPAND — a world slowly being unmade by shadow.
 
 ═══ ABSOLUTE RULES ═══
 
@@ -349,13 +381,41 @@ GM_INSTRUCTION = """You are a strict, grounded, and imaginative Game Master runn
    Dark, literary, grounded. No comic relief unless the player initiates it. No exposition dumps. Show, don't tell. Sentences can be short and punishing.
 
 9. RESPONSE LENGTH
-   2–4 paragraphs per turn. No more. Leave space for the player to act.
-"""
+   2–4 paragraphs per turn. No more. Leave space for the player to act."""
+
+
+def _count_tokens(text: str) -> int:
+    """
+    Fast approximate token count using the loaded tokenizer.
+    Used to guard against context-window overflow before calling generate().
+    """
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
+
+def _trim_history_to_fit(history: list, base_ctx: str, budget: int) -> list:
+    """
+    Drop oldest history turns until base_ctx + history fits within budget.
+    Always keeps at least the most recent turn for continuity.
+    """
+    trimmed = list(history)
+    while len(trimmed) > 1:
+        history_text = "".join(
+            f"Player: {t['action']}\nGM: {t['response']}\n\n"
+            for t in trimmed
+        )
+        if _count_tokens(base_ctx + history_text) <= budget:
+            break
+        trimmed.pop(0)   # drop oldest
+    return trimmed
 
 
 def build_prompt(state: dict, user_action: str, roll: int, risk_type: str,
-                 reality_violation: str | None, stat_note: str) -> str:
-
+                 reality_violation: Optional[str], stat_note: str) -> str:
+    """
+    Assemble a Llama 3 chat-formatted prompt string.
+    Trims conversation history if the total token count would exceed
+    MAX_PROMPT_TOKENS, preventing silent OOM crashes on long sessions.
+    """
     player   = state["player"]
     world    = state["world"]
     loc_name = world["current_location"]
@@ -364,50 +424,68 @@ def build_prompt(state: dict, user_action: str, roll: int, risk_type: str,
     objects   = ", ".join(node["objects"]) if node["objects"] else "nothing of obvious interest"
     exits     = ", ".join(node["connections"].keys()) if node["connections"] else "none mapped yet"
     inventory = ", ".join(player["inventory"]) if player["inventory"] else "nothing"
+    s         = player["stats"]
 
-    # Rolling context window: last 3 turns
-    history_text = ""
-    for turn in state["history"][-3:]:
-        history_text += f'Player: {turn["action"]}\nGM: {turn["response"]}\n\n'
+    # ── Static context (location + player state + lore) ───────────────────
+    base_ctx  = f"[LOCATION]\nName: {loc_name}\nDescription: {node['description']}\n"
+    base_ctx += f"Objects here: {objects}\nKnown exits: {exits}\n\n"
+    base_ctx += f"[PLAYER STATE]\nName: {player['name']}\nInventory: {inventory}\n"
+    base_ctx += (f"HP: {s['hp']}/{s['hp_max']} | "
+                 f"Stamina: {s['stamina']}/{s['stamina_max']} | "
+                 f"Sanity: {s['sanity']}/{s['sanity_max']}\n\n")
+    base_ctx += f"[SECRET LORE]\n{get_relevant_lore(loc_name + ' ' + user_action)}\n\n"
 
-    # Build the context block
-    ctx  = f"[LOCATION]\nName: {loc_name}\nDescription: {node['description']}\n"
-    ctx += f"Objects here: {objects}\nKnown exits: {exits}\n\n"
-    ctx += f"[PLAYER STATE]\nName: {player['name']}\nInventory: {inventory}\n"
-    s    = player["stats"]
-    ctx += (f"HP: {s['hp']}/{s['hp_max']} | "
-            f"Stamina: {s['stamina']}/{s['stamina_max']} | "
-            f"Sanity: {s['sanity']}/{s['sanity_max']}\n\n")
-
-    ctx += f"[SECRET LORE]\n{get_relevant_lore(loc_name + ' ' + user_action)}\n\n"
-
-    if history_text:
-        ctx += f"[RECENT HISTORY]\n{history_text}"
-
-    ctx += f"[CURRENT ACTION — tagged {risk_type.upper()}]\n"
-
+    # ── Action block ───────────────────────────────────────────────────────
+    action_block  = f"[CURRENT ACTION — tagged {risk_type.upper()}]\n"
     if is_dead(player):
-        ctx += "[PLAYER IS DEAD] Narrate the death scene.\n"
+        action_block += "[PLAYER IS DEAD] Narrate the death scene.\n"
     elif is_insane(player):
-        ctx += "[PLAYER SANITY BROKEN] The player's mind has shattered. Their perception of reality is completely unreliable. Narrate accordingly.\n"
+        action_block += ("[PLAYER SANITY BROKEN] The player's mind has shattered. "
+                         "Their perception of reality is completely unreliable. Narrate accordingly.\n")
 
     if reality_violation:
-        ctx += f"\n[REALITY VIOLATION DETECTED]\n{reality_violation}\n"
-        ctx += "Enforce this violation. Do NOT allow the action to succeed or partially succeed.\n"
+        action_block += f"\n[REALITY VIOLATION DETECTED]\n{reality_violation}\n"
+        action_block += "Enforce this violation. Do NOT allow the action to succeed or partially succeed.\n"
     else:
-        ctx += f"[D20 ROLL: {roll}/20 — enforce the result for {risk_type} actions.]\n"
+        action_block += f"[D20 ROLL: {roll}/20 — enforce the result for {risk_type} actions.]\n"
         if stat_note:
-            ctx += f"{stat_note}\n"
+            action_block += f"{stat_note}\n"
 
-    ctx += f"\nPlayer says: {user_action}"
+    action_block += f"\nPlayer says: {user_action}"
 
-    return ALPACA_PROMPT.format(GM_INSTRUCTION, ctx, "")
+    # ── History (trimmed to fit token budget) ─────────────────────────────
+    trimmed_history = _trim_history_to_fit(
+        state["history"][-6:],   # consider at most last 6 turns
+        base_ctx + action_block,
+        MAX_PROMPT_TOKENS,
+    )
+    history_text = ""
+    if trimmed_history:
+        history_text = "[RECENT HISTORY]\n"
+        for turn in trimmed_history:
+            history_text += f"Player: {turn['action']}\nGM: {turn['response']}\n\n"
+
+    # ── Assemble Llama 3 chat prompt ───────────────────────────────────────
+    user_content = base_ctx + history_text + action_block
+
+    prompt = (
+        "<|begin_of_text|>"
+        "<|start_header_id|>system<|end_header_id|>\n\n"
+        f"{GM_SYSTEM_PROMPT}"
+        "<|eot_id|>"
+        "<|start_header_id|>user<|end_header_id|>\n\n"
+        f"{user_content}"
+        "<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+
+    return prompt
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 5 — RESPONSE PARSING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parse_response(raw: str, state: dict) -> tuple[str, bool]:
+def parse_response(raw: str, state: dict) -> Tuple[str, bool]:
     """
     Parse the GM's raw response for system tags.
     Mutates state (world_graph, inventory) in place.
@@ -596,16 +674,27 @@ def run():
         # ── Build & send prompt ────────────────────────────────────────────
         prompt = build_prompt(state, user_action, roll, risk_type, reality_violation, stat_note)
 
-        inputs  = tokenizer([prompt], return_tensors="pt").to("cuda")
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens     = 420,
-            use_cache          = True,
-            temperature        = 0.75,
-            repetition_penalty = 1.15,
-        )
-        raw_output = tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
-        raw_response = raw_output.split("### Response:\n")[-1].strip()
+        inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
+
+        # Llama 3 shares eos_token_id and pad_token_id — setting pad_token_id
+        # explicitly silences the "Setting pad_token_id to eos_token_id"
+        # warning and prevents incorrect padding during beam search.
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens     = 420,
+                do_sample          = True,       # required for temperature to work
+                temperature        = 0.75,
+                repetition_penalty = 1.15,
+                use_cache          = True,
+                pad_token_id       = tokenizer.eos_token_id,
+            )
+
+        # Decode only the newly generated tokens (not the prompt).
+        # inputs["input_ids"].shape[1] is the prompt length in tokens.
+        prompt_len   = inputs["input_ids"].shape[1]
+        new_tokens   = outputs[0][prompt_len:]
+        raw_response = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
         # ── Parse GM response ──────────────────────────────────────────────
         display_text, loc_changed = parse_response(raw_response, state)

@@ -1,9 +1,15 @@
 import os
 import sys
-import shutil
 import torch
+
+# 🔥 THE FIX: Force-load the inductor config before importing Unsloth
+try:
+    import torch._inductor.config
+except ImportError:
+    pass 
+
+import shutil
 from huggingface_hub import HfApi, login
-from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
 
 def run_checks():
     print("🚀 Starting Pre-Flight Check for EXPAND...")
